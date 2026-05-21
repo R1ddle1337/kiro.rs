@@ -60,11 +60,13 @@ jobs:
 
       - name: Resolve Docker Hub repo
         id: repo
+        env:
+          # Avoid referencing secrets here so the value can be safely passed via
+          # job outputs (GitHub Actions redacts any output containing a secret).
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          NAMESPACE="${{ secrets.DOCKERHUB_USERNAME }}"
-          if [ -z "$NAMESPACE" ]; then
-            NAMESPACE="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          fi
+          NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
           echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
 
       - name: Determine version

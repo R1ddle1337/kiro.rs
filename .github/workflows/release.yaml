@@ -37,19 +37,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve Docker Hub repo
-        id: repo
-        run: |
-          # 优先使用仓库 Secret/Variable 显式配置，否则按 GitHub owner 小写映射
-          NAMESPACE="${{ secrets.DOCKERHUB_USERNAME }}"
-          if [ -z "$NAMESPACE" ]; then
-            NAMESPACE="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          fi
-          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
-
       - name: Validate version
         id: meta
         shell: bash
+        env:
+          # Resolve Docker Hub namespace without referencing secrets, otherwise
+          # job outputs would be redacted to an empty string when passed across jobs.
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -84,9 +79,11 @@ jobs:
 
           TARGET="$(git rev-list -n 1 "${TAG}" 2>/dev/null || echo "${GITHUB_SHA}")"
 
+          NAMESPACE="${DOCKERHUB_NAMESPACE:-$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')}"
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "image=${{ steps.repo.outputs.namespace }}/kiro-rs" >> "$GITHUB_OUTPUT"
+          echo "image=${NAMESPACE}/kiro-rs" >> "$GITHUB_OUTPUT"
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
 
