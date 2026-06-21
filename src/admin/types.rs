@@ -27,6 +27,10 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 每分钟请求数上限（0 = 不限速）
+    pub rpm_limit: u32,
+    /// 当前滑动窗口内已用请求条数
+    pub rpm_current: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数

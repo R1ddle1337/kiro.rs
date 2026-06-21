@@ -562,6 +562,8 @@ impl AdminService {
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
+                    rpm_limit: entry.rpm_limit,
+                    rpm_current: entry.rpm_current,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
