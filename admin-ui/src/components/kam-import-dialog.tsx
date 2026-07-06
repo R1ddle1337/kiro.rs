@@ -20,7 +20,7 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -45,7 +45,7 @@ interface KamAccount {
     authMethod?: string
     provider?: string
     startUrl?: string
-    // 企业 SSO（external_idp / Entra ID / Azure AD）：有 clientId + tokenEndpoint，无 clientSecret
+    // 企业 SSO (external_idp)
     tokenEndpoint?: string
     issuerUrl?: string
     scopes?: string
@@ -372,44 +372,22 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         const issuerUrl = cred.issuerUrl?.trim() || undefined
         const scopes = cred.scopes?.trim() || undefined
 
-        // 认证方式优先取显式 authMethod；未声明时按字段推断：
-        // 有 tokenEndpoint → external_idp（企业 SSO / Entra ID）；
-        // 有 clientId+clientSecret → idc；否则 social。
-        const declared = cred.authMethod?.trim().toLowerCase()
-        let authMethod: 'social' | 'idc' | 'external_idp'
-        if (declared === 'external_idp') {
-          authMethod = 'external_idp'
-        } else if (declared === 'idc' || declared === 'builder-id' || declared === 'iam') {
-          authMethod = 'idc'
-        } else if (declared === 'social') {
-          authMethod = 'social'
-        } else if (tokenEndpoint) {
-          authMethod = 'external_idp'
-        } else if (clientId && clientSecret) {
-          authMethod = 'idc'
-        } else {
-          authMethod = 'social'
-        }
 
+        const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
+          tokenEndpoint,
+          clientId,
+          clientSecret,
+        })
+        if (authError) {
+          updateResult(i, { status: 'failed', error: authError })
+          continue
+        }
+        const isExternalIdp = authMethod === 'external_idp'
+        // provider 缺失时企业 SSO 回退 AzureAD，其余沿用 idp 别名
         const provider =
           cred.provider?.trim() ||
           account.idp?.trim() ||
-          (authMethod === 'external_idp' ? 'AzureAD' : undefined)
-
-        // 各方式的必填字段校验
-        if (authMethod === 'idc' && !(clientId && clientSecret)) {
-          updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
-          continue
-        }
-        if (authMethod === 'external_idp' && !(clientId && tokenEndpoint)) {
-          updateResult(i, {
-            status: 'failed',
-            error: 'external_idp（企业 SSO / Entra ID）需要同时提供 clientId 和 tokenEndpoint',
-          })
-          continue
-        }
-
-        const isExternalIdp = authMethod === 'external_idp'
+          (isExternalIdp ? 'AzureAD' : undefined)
 
         // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
         const proxyUrl = enabledProxies.length > 0

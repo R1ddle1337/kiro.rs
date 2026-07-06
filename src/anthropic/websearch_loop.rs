@@ -26,11 +26,12 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::handlers::{UsageRecordHook, map_provider_error};
-use super::stream::SseEvent;
+use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
+use crate::model::config::ToolCompatibilityMode;
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
@@ -40,7 +41,7 @@ struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
-    tool_uses: Vec<DecodedToolUse>,
+    tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
     context_input_tokens: Option<i32>,
     /// Cumulative credits from meteringEvent
@@ -61,30 +62,21 @@ struct RoundOutcome {
     tool_name_map: std::collections::HashMap<String, String>,
 }
 
-/// A fully decoded tool_use
-struct DecodedToolUse {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-impl DecodedToolUse {
-    fn query(&self) -> String {
-        self.input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
+/// 提取工具调用入参里的 `query` 字段（web_search 专用便捷函数）。
+fn tool_query(tu: &CompletedToolUse) -> String {
+    tu.input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Decides whether this round should keep searching (enter the next loop round)
 ///
 /// Continue condition: every tool_use this round is web_search (at least one) and the round limit has not been reached.
 /// As soon as a client tool such as exec is mixed in, there is no tool_use at all, or the limit is reached, it stops and flushes (exec is never swallowed).
-fn should_search_round(round_idx: usize, tool_uses: &[DecodedToolUse]) -> bool {
-    let only_web_search =
-        !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
+fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool {
+    let only_web_search = !tool_uses.is_empty() && tool_uses.iter().all(|t| t.name == "web_search");
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
 }
 
@@ -102,7 +94,7 @@ async fn decode_round(
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<DecodedToolUse> = Vec::new();
+    let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
@@ -174,14 +166,13 @@ async fn decode_round(
                     json!({})
                 })
             };
-            let original_name = tool_name_map.get(&name).cloned().unwrap_or(name);
-            tool_uses.push(DecodedToolUse {
-                id,
-                name: original_name,
-                input,
-            });
+            // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
+            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
         }
     }
+
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
+    let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
 
     RoundOutcome {
         text,
@@ -206,8 +197,9 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request(payload) {
+    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -217,9 +209,15 @@ async fn run_round(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
                 }
+                ConversionError::UnsupportedToolMapping(reason) => (
+                    "invalid_request_error",
+                    format!("unsupported tool mapping: {}", reason),
+                ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
+            return Err(
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response()
+            );
         }
     };
 
@@ -234,7 +232,10 @@ async fn run_round(
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("failed to serialize request: {}", e),
+                )),
             )
                 .into_response());
         }
@@ -248,8 +249,12 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
-    let mut outcome =
-        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
+    let mut outcome = decode_round(
+        call_result.response,
+        &payload.model,
+        &conversion.tool_name_map,
+    )
+    .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;
@@ -263,7 +268,8 @@ async fn run_round(
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
                 "upstream_error",
-                "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
+                "Upstream response stream ended unexpectedly during the web_search loop."
+                    .to_string(),
             )),
         )
             .into_response());
@@ -287,9 +293,7 @@ fn append_search_round(
         assistant_content.push(json!({"type": "text", "text": round.text}));
     }
     for tu in &round.tool_uses {
-        assistant_content.push(json!({
-            "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-        }));
+        assistant_content.push(tu.to_anthropic_block());
     }
     payload.messages.push(Message {
         role: "assistant".to_string(),
@@ -299,7 +303,7 @@ fn append_search_round(
     // user: each web_search tool_use is paired with a tool_result (content = search summary, shown to the upstream)
     let mut user_content: Vec<Value> = Vec::new();
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
-        let query = tu.query();
+        let query = tool_query(tu);
         let summary = websearch::generate_search_summary(&query, results);
         user_content.push(json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
@@ -353,8 +357,8 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
 /// as a raw tool_use": every flush path partitions first, then handles each
 /// group differently (web_search -> presentation blocks, client tools -> raw).
 fn partition_tool_uses(
-    tool_uses: &[DecodedToolUse],
-) -> (Vec<&DecodedToolUse>, Vec<&DecodedToolUse>) {
+    tool_uses: &[CompletedToolUse],
+) -> (Vec<&CompletedToolUse>, Vec<&CompletedToolUse>) {
     let mut web = Vec::new();
     let mut client = Vec::new();
     for tu in tool_uses {
@@ -436,7 +440,7 @@ fn canonical_input_key(input: &Value) -> String {
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
-    tool_uses: &[DecodedToolUse],
+    tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
@@ -471,7 +475,8 @@ fn build_flush_content(
             .filter(|t| t.name != "web_search")
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
-        for block in super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
+        for block in
+            super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
         {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -495,7 +500,7 @@ fn build_flush_content(
         if tu.name == "web_search" {
             // INVARIANT: present as server_tool_use + web_search_tool_result,
             // never as a raw tool_use.
-            let query = tu.query();
+            let query = tool_query(tu);
             let (srv_id, _mcp) = websearch::create_mcp_request(&query);
             content.push(json!({
                 "type": "server_tool_use", "id": srv_id, "name": "web_search",
@@ -508,9 +513,7 @@ fn build_flush_content(
             }));
         } else {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
-            content.push(json!({
-                "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-            }));
+            content.push(tu.to_anthropic_block());
         }
     }
     content
@@ -525,6 +528,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -539,20 +543,29 @@ pub(super) async fn run_web_search_loop(
     let mut total_credits = 0.0;
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
-        let (round, credential_id) =
-            match run_round(&provider, &payload, &hook, fallback_input_tokens, group.as_deref()).await {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+        let (round, credential_id) = match run_round(
+            &provider,
+            &payload,
+            &hook,
+            fallback_input_tokens,
+            group.as_deref(),
+            tool_compatibility_mode,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         last_credential_id = credential_id;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
-            let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
+            let mut searched: Vec<Option<WebSearchResults>> =
+                Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
                 match websearch::call_mcp_api(&provider, &mcp_request).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
@@ -591,7 +604,7 @@ pub(super) async fn run_web_search_loop(
         let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
-                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
+                let (_id, mcp_request) = websearch::create_mcp_request(&tool_query(tu));
                 match websearch::call_mcp_api(&provider, &mcp_request).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
@@ -644,17 +657,40 @@ pub(super) async fn run_web_search_loop(
         );
 
         return if stream_client {
-            render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
+            render_sse(
+                &payload.model,
+                content,
+                &stop_reason,
+                final_input,
+                output_tokens,
+            )
         } else {
-            render_json(&payload.model, content, &stop_reason, final_input, output_tokens)
+            render_json(
+                &payload.model,
+                content,
+                &stop_reason,
+                final_input,
+                output_tokens,
+            )
         };
     }
 
     // Theoretically unreachable (the loop always returns)
-    hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    hook.record(
+        last_credential_id,
+        fallback_input_tokens,
+        0,
+        0,
+        0,
+        total_credits,
+        "error",
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
+        Json(ErrorResponse::new(
+            "internal_error",
+            "web_search loop exited unexpectedly",
+        )),
     )
         .into_response()
 }
@@ -717,10 +753,7 @@ fn build_sse_events(
     output_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        &Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
+    let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
 
     events.push(SseEvent::new(
         "message_start",
@@ -750,54 +783,84 @@ fn build_sse_events(
         match btype {
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                })));
-                events.push(SseEvent::new("content_block_delta", json!({
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "text_delta", "text": text}
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             "tool_use" => {
                 let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                 let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-                })));
-                events.push(SseEvent::new("content_block_delta", json!({
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "input_json_delta", "partial_json": partial}
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": partial}
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             "server_tool_use" | "web_search_tool_result" => {
-                events.push(SseEvent::new("content_block_start", json!({
-                    "type": "content_block_start", "index": index,
-                    "content_block": block
-                })));
-                events.push(SseEvent::new("content_block_stop", json!({
-                    "type": "content_block_stop", "index": index
-                })));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start", "index": index,
+                        "content_block": block
+                    }),
+                ));
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop", "index": index
+                    }),
+                ));
             }
             _ => {}
         }
     }
 
-    events.push(SseEvent::new("message_delta", json!({
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason},
-        "usage": {"output_tokens": output_tokens}
-    })));
-    events.push(SseEvent::new("message_stop", json!({"type": "message_stop"})));
+    events.push(SseEvent::new(
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {"output_tokens": output_tokens}
+        }),
+    ));
+    events.push(SseEvent::new(
+        "message_stop",
+        json!({"type": "message_stop"}),
+    ));
 
     events
 }
@@ -807,8 +870,8 @@ mod tests {
     use super::*;
     use crate::anthropic::websearch::{WebSearchResult, WebSearchResults};
 
-    fn tu(name: &str) -> DecodedToolUse {
-        DecodedToolUse {
+    fn tu(name: &str) -> CompletedToolUse {
+        CompletedToolUse {
             id: format!("toolu_{}", name),
             name: name.to_string(),
             input: json!({"query": "rust 2026"}),
@@ -848,7 +911,7 @@ mod tests {
     #[test]
     fn round_with_no_tool_use_does_not_enter_loop() {
         // Skip: no tool_use at all (plain-text answer) -> terminate
-        let empty: Vec<DecodedToolUse> = vec![];
+        let empty: Vec<CompletedToolUse> = vec![];
         assert!(!should_search_round(0, &empty));
     }
 
@@ -930,17 +993,22 @@ mod tests {
 
         // the server_tool_use block is placed into content_block_start as-is
         let has_server_tool = events.iter().any(|e| {
-            e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "server_tool_use"
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "server_tool_use"
         });
-        assert!(has_server_tool, "the server_tool_use block should be presented");
+        assert!(
+            has_server_tool,
+            "the server_tool_use block should be presented"
+        );
 
         // the web_search_tool_result block is presented
         let has_result = events.iter().any(|e| {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "web_search_tool_result"
         });
-        assert!(has_result, "the web_search_tool_result block should be presented");
+        assert!(
+            has_result,
+            "the web_search_tool_result block should be presented"
+        );
 
         // exec tool_use is not swallowed: name=exec appears in start
         let has_exec = events.iter().any(|e| {
@@ -948,7 +1016,10 @@ mod tests {
                 && e.data["content_block"]["type"] == "tool_use"
                 && e.data["content_block"]["name"] == "exec"
         });
-        assert!(has_exec, "the exec tool_use must be returned to the client as-is and not swallowed");
+        assert!(
+            has_exec,
+            "the exec tool_use must be returned to the client as-is and not swallowed"
+        );
     }
     // ---- INVARIANT: web_search must NEVER leave kiro-rs as a raw tool_use ----
     // Regression for the "mixed-round leak": when the final round mixes web_search
@@ -980,8 +1051,14 @@ mod tests {
     fn flush_content_mixed_round_never_emits_raw_web_search() {
         let tool_uses = vec![tu("web_search"), tu("exec")];
         let searched = vec![fake_results("rust 2026"), None];
-        let content =
-            build_flush_content(Vec::new(), "answer", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "answer",
+            &tool_uses,
+            &searched,
+            &names(&["exec"]),
+            &nomap(),
+        );
 
         let raw_web_search = content
             .iter()
@@ -1022,7 +1099,14 @@ mod tests {
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
         let searched: Vec<Option<WebSearchResults>> = vec![None];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "",
+            &tool_uses,
+            &searched,
+            &names(&["exec"]),
+            &nomap(),
+        );
         assert!(
             content
                 .iter()
@@ -1066,10 +1150,17 @@ mod tests {
             content
         );
         let reclaimed = content.iter().find(|c| c["type"] == "tool_use");
-        assert!(reclaimed.is_some(), "must reclaim a structured tool_use. content={:?}", content);
+        assert!(
+            reclaimed.is_some(),
+            "must reclaim a structured tool_use. content={:?}",
+            content
+        );
         let tu = reclaimed.unwrap();
         assert_eq!(tu["name"], "exec_command");
-        assert_eq!(tu["input"]["cmd"], "echo hi", "parameter must be parsed into input");
+        assert_eq!(
+            tu["input"]["cmd"], "echo hi",
+            "parameter must be parsed into input"
+        );
         // the stray `call` line in front of the invoke must be stripped, not leaked
         assert!(
             !content
@@ -1084,15 +1175,29 @@ mod tests {
         // Narrative text before the leaked invoke must be preserved as a text block,
         // and the invoke still reclaimed.
         let leaked = "Here is the result.\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(!leaks_literal_invoke(&content));
         assert!(
             content.iter().any(|c| c["type"] == "text"
-                && c["text"].as_str().unwrap_or("").contains("Here is the result.")),
+                && c["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Here is the result.")),
             "narrative text must be preserved. content={:?}",
             content
         );
-        assert!(content.iter().any(|c| c["type"] == "tool_use" && c["name"] == "exec_command"));
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
+        );
     }
 
     // ---- SAFETY GATES: must NOT reclaim (would risk executing discussed commands) ----
@@ -1102,7 +1207,14 @@ mod tests {
         // An <invoke> shown inside a ``` code fence is a DISPLAY/discussion, not a real call.
         // It must stay as text, never become a tool_use.
         let text = "Look at this example:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "fenced <invoke> must NOT be reclaimed (it's a display). content={:?}",
@@ -1114,7 +1226,14 @@ mod tests {
     fn flush_content_does_not_reclaim_invoke_mid_sentence() {
         // <invoke> embedded mid-sentence (not at line start) is discussion text, not a call.
         let text = "the tag <invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke> means a call";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "mid-sentence <invoke> must NOT be reclaimed. content={:?}",
@@ -1127,7 +1246,14 @@ mod tests {
         // Tool-table guard: a clean line-start <invoke> whose name is NOT a declared tool
         // must NOT be reclaimed (never synthesize a call for an unknown tool).
         let leaked = "call\n<invoke name=\"definitely_not_a_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unknown tool name must NOT be reclaimed. content={:?}",
@@ -1202,7 +1328,14 @@ mod tests {
     #[test]
     fn flush_content_clean_text_is_single_text_block() {
         // No <invoke> at all -> behavior identical to before: one text block, unchanged.
-        let content = build_flush_content(Vec::new(), "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "just a normal answer",
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "just a normal answer");
@@ -1222,7 +1355,12 @@ mod tests {
         );
         assert!(!leaks_literal_invoke(&content));
         let tus: Vec<&Value> = content.iter().filter(|c| c["type"] == "tool_use").collect();
-        assert_eq!(tus.len(), 2, "both invokes reclaimed. content={:?}", content);
+        assert_eq!(
+            tus.len(),
+            2,
+            "both invokes reclaimed. content={:?}",
+            content
+        );
         assert_eq!(tus[0]["name"], "exec_command");
         assert_eq!(tus[0]["input"]["cmd"], "a");
         assert_eq!(tus[1]["name"], "get_time");
@@ -1233,7 +1371,14 @@ mod tests {
     fn flush_content_unclosed_invoke_stays_text() {
         // An <invoke> with no closing tag in the complete text is not a clean call -> keep as text.
         let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            text,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unclosed <invoke> must NOT be reclaimed. content={:?}",
@@ -1254,14 +1399,7 @@ mod tests {
         );
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
-        let content = build_flush_content(
-            Vec::new(),
-            &leaked,
-            &[],
-            &[],
-            &names(&[short]),
-            &map,
-        );
+        let content = build_flush_content(Vec::new(), &leaked, &[], &[], &names(&[short]), &map);
         let tu = content
             .iter()
             .find(|c| c["type"] == "tool_use")
@@ -1281,7 +1419,14 @@ mod tests {
         // stop_reason="tool_use". This test pins that contract: a leaked invoke with an empty
         // tool_uses list still yields a client tool_use block in the content.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
         let has_client_tool_use = content
             .iter()
             .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
@@ -1352,7 +1497,8 @@ mod tests {
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
         let searched = vec![fake_results("q")];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let content =
+            build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -1372,7 +1518,7 @@ mod tests {
         // The reclaimed-from-text tool_use must be suppressed when an identical
         // (name + canonical input) structured tool_use already exists in this round.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf build</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_dup".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "rm -rf build"}),
@@ -1401,7 +1547,7 @@ mod tests {
         // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
         // different input than the structured one is a distinct action and must be kept.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let structured = vec![DecodedToolUse {
+        let structured = vec![CompletedToolUse {
             id: "toolu_other".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "pwd"}),

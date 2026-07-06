@@ -88,11 +88,8 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
-            req = req.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -109,11 +106,8 @@ impl KiroEndpoint for IdeEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
-            req = req.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }

@@ -20,7 +20,7 @@ import {
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -265,51 +265,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const issuerUrl = cred.issuerUrl?.trim() || undefined
           const scopes = cred.scopes?.trim() || undefined
 
-          // 认证方式优先取 JSON 中显式声明的 authMethod；未声明时按字段推断：
-          // 有 tokenEndpoint → external_idp；有 clientId+clientSecret → idc；否则 social。
-          const declared = cred.authMethod?.trim().toLowerCase()
-          let authMethod: 'social' | 'idc' | 'external_idp'
-          if (declared === 'external_idp') {
-            authMethod = 'external_idp'
-          } else if (
-            declared === 'idc' ||
-            declared === 'builder-id' ||
-            declared === 'iam'
-          ) {
-            authMethod = 'idc'
-          } else if (declared === 'social') {
-            authMethod = 'social'
-          } else if (tokenEndpoint) {
-            authMethod = 'external_idp'
-          } else if (clientId && clientSecret) {
-            authMethod = 'idc'
-          } else {
-            authMethod = 'social'
-          }
-
-          // 各方式的必填字段校验
-          if (authMethod === 'idc' && !(clientId && clientSecret)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'idc 模式需要同时提供 clientId 和 clientSecret',
-            })
-            continue
-          }
-          if (authMethod === 'external_idp' && !(clientId && tokenEndpoint)) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'external_idp（Entra ID / Azure AD）需要同时提供 clientId 和 tokenEndpoint',
-            })
-            continue
-          }
-          if (
-            authMethod === 'social' &&
-            (clientSecret || (clientId && !tokenEndpoint))
-          ) {
-            updateResult(i, {
-              status: 'failed',
-              error: 'social 模式不应携带 clientId/clientSecret；如为企业 SSO 请设置 authMethod=external_idp 并提供 tokenEndpoint',
-            })
+          const { authMethod, error: authError } = normalizeImportAuthMethod(cred.authMethod, {
+            tokenEndpoint,
+            clientId,
+            clientSecret,
+          })
+          if (authError) {
+            updateResult(i, { status: 'failed', error: authError })
             continue
           }
 
@@ -508,7 +470,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n企业 SSO: [{"authMethod":"external_idp","refreshToken":"...","clientId":"...","tokenEndpoint":"https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token","scopes":"...","region":"eu-central-1"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

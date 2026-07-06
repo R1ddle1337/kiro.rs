@@ -266,10 +266,7 @@ impl TraceStore {
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
             if !existing.contains(name) {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE traces ADD COLUMN {} {};",
-                    name, def
-                ))?;
+                conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {} {};", name, def))?;
             }
         }
         // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
@@ -1014,7 +1011,10 @@ mod tests {
         });
         assert!(out.is_empty(), "clear_all 后应无任何 trace");
         // attempts 也应清空：failure_stats 不再有任何条目
-        assert!(store.failure_stats().is_empty(), "clear_all 后 attempts 应清空");
+        assert!(
+            store.failure_stats().is_empty(),
+            "clear_all 后 attempts 应清空"
+        );
         // 空库再清一次返回 0，不报错
         assert_eq!(store.clear_all(), 0);
     }

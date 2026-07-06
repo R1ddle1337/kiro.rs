@@ -161,7 +161,10 @@ mod tests {
             endpoint.api_url(&rctx),
             "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
         );
-        assert_eq!(endpoint.mcp_url(&rctx), "https://runtime.us-east-1.kiro.dev/mcp");
+        assert_eq!(
+            endpoint.mcp_url(&rctx),
+            "https://runtime.us-east-1.kiro.dev/mcp"
+        );
         assert_eq!(endpoint.host(&rctx), "runtime.us-east-1.kiro.dev");
     }
 

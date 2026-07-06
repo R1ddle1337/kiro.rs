@@ -33,8 +33,7 @@ impl CliEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version,
-            ctx.config.kiro_version,
+            ctx.config.system_version, ctx.config.kiro_version,
         )
     }
 
@@ -88,11 +87,8 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
-            req = req.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -109,11 +105,8 @@ impl KiroEndpoint for CliEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
-        } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
-            req = req.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", token_type);
         }
         req
     }
@@ -134,7 +127,10 @@ fn set_origin_kiro_cli(body: &str) -> String {
         return body;
     };
 
-    if let Some(state) = json.get_mut("conversationState").and_then(|v| v.as_object_mut()) {
+    if let Some(state) = json
+        .get_mut("conversationState")
+        .and_then(|v| v.as_object_mut())
+    {
         state.remove("agentContinuationId");
 
         if let Some(history) = state.get_mut("history").and_then(|v| v.as_array_mut()) {

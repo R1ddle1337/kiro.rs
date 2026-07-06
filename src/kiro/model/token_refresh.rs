@@ -43,11 +43,10 @@ pub struct IdcRefreshResponse {
     pub profile_arn: Option<String>,
 }
 
-/// 外部 IdP（Microsoft Entra ID / Azure AD）Token 刷新响应体
+/// 企业 SSO (external_idp，如 Microsoft Entra ID / Azure AD) Token 刷新响应体。
 ///
-/// 标准 OAuth2 token 端点响应（**snake_case**，区别于 Social/IdC 的 camelCase）。
-/// 公共客户端 `refresh_token` grant；IdP 不返回 profileArn（由
-/// `ListAvailableProfiles` 用 EXTERNAL_IDP token 类型单独解析）。
+/// 标准 OAuth2 token 端点响应（snake_case，区别于 Social/IdC 的 camelCase）。
+/// IdP 不返回 profileArn，由 `ListAvailableProfiles` 用 EXTERNAL_IDP token 类型解析。
 #[derive(Debug, Default, Deserialize)]
 pub struct ExternalIdpRefreshResponse {
     #[serde(default)]
@@ -206,5 +205,6 @@ mod tests {
         let resp: ExternalIdpRefreshResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.access_token.as_deref(), Some("a"));
         assert!(resp.refresh_token.is_none());
+        assert_eq!(resp.expires_in, Some(3600));
     }
 }

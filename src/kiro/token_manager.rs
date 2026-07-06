@@ -122,6 +122,13 @@ pub(crate) async fn refresh_token(
 
     validate_refresh_token(credentials)?;
 
+    // 企业 SSO (external_idp) 走 IdP token 端点刷新（refresh_token grant，public client），
+    // 而非 AWS SSO OIDC / Social 端点。必须在下面的 idc/social 自动判断之前分流：
+    // external_idp 有 clientId 但无 clientSecret，落到自动判断会被误判为 social。
+    if credentials.is_external_idp_credential() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
+
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
@@ -325,95 +332,102 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
-/// 刷新外部 IdP（Microsoft Entra ID / Azure AD）Token
+/// 刷新企业 SSO (external_idp，如 Microsoft Entra ID / Azure AD) Token。
 ///
 /// 通过 IdP 的 OAuth2 token 端点以公共客户端 `refresh_token` grant 刷新（无
-/// client_secret）。原始登录 scope 中的 `offline_access` 才会让 IdP 下发
-/// refresh_token。IdP 不返回 profileArn —— 真实 ARN 由
-/// [`list_available_profiles`]（携带 `TokenType: EXTERNAL_IDP` 头）单独解析回填。
+/// client_secret）。IdP 不返回 profileArn；真实 ARN 由 `list_available_profiles`
+/// 携带 `TokenType: EXTERNAL_IDP` 头单独解析回填。
 async fn refresh_external_idp_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新外部 IdP (Entra ID / Azure AD) Token...");
+    tracing::info!("正在刷新 External IdP (企业 SSO) Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
         .client_id
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 clientId"))?;
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
     let token_endpoint = credentials
         .token_endpoint
-        .as_ref()
+        .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("外部 IdP 刷新需要 tokenEndpoint"))?;
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
 
-    // 表单字段：client_id + grant_type=refresh_token + refresh_token，scope 可选
+    crate::kiro::model::credentials::validate_external_idp_endpoint(token_endpoint)
+        .map_err(|e| anyhow::anyhow!("External IdP tokenEndpoint 被拒绝: {}", e))?;
+
     let mut form: Vec<(&str, &str)> = vec![
-        ("client_id", client_id.as_str()),
+        ("client_id", client_id),
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token.as_str()),
     ];
-    if let Some(scopes) = credentials.scopes.as_deref() {
-        if !scopes.trim().is_empty() {
-            form.push(("scope", scopes));
-        }
+    if let Some(scopes) = credentials
+        .scopes
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        form.push(("scope", scopes));
     }
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let response = client
         .post(token_endpoint)
         .header("Accept", "application/json")
-        // reqwest 的 .form(...) 会设置 Content-Type: application/x-www-form-urlencoded
         .form(&form)
         .send()
         .await?;
 
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
-    let data: ExternalIdpRefreshResponse =
-        serde_json::from_str(&body_text).unwrap_or_default();
+    let data: ExternalIdpRefreshResponse = serde_json::from_str(&body_text).unwrap_or_default();
 
-    // 非 2xx 或缺少 access_token 视为失败
     let access_token = match data.access_token {
-        Some(t) if status.is_success() && !t.is_empty() => t,
+        Some(token) if status.is_success() && !token.is_empty() => token,
         _ => {
-            // invalid_grant → refreshToken 永久失效，交由上层自动禁用
             let is_invalid_grant = data
                 .error
                 .as_deref()
                 .map(|e| e.eq_ignore_ascii_case("invalid_grant"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || (status.as_u16() == 400 && body_text.contains("invalid_grant"));
             if is_invalid_grant {
                 return Err(RefreshTokenInvalidError {
                     message: format!(
-                        "外部 IdP refreshToken 已失效 (invalid_grant): {}",
+                        "External IdP refreshToken 已失效 (invalid_grant): {}",
                         data.error_description.as_deref().unwrap_or(&body_text)
                     ),
                 }
                 .into());
             }
+
             if let Some(err) = data.error {
                 bail!(
-                    "外部 IdP Token 刷新失败 {}: {}: {}",
+                    "External IdP Token 刷新失败 {}: {}: {}",
                     status,
                     err,
                     data.error_description.unwrap_or_default()
                 );
             }
-            bail!("外部 IdP Token 刷新失败 {}: {}", status, body_text);
+
+            let error_msg = match status.as_u16() {
+                401 => "企业 SSO 凭证已过期或无效，需要重新认证",
+                403 => "权限不足，无法刷新 Token",
+                429 => "请求过于频繁，已被限流",
+                500..=599 => "服务器错误，IdP token 端点暂时不可用",
+                _ => "External IdP Token 刷新失败",
+            };
+            bail!("{}: {} {}", error_msg, status, body_text);
         }
     };
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(access_token);
 
-    // 部分 IdP（Azure AD）会轮换 refresh_token；未返回新值时保留原 refresh_token
-    if let Some(new_refresh_token) = data.refresh_token {
-        if !new_refresh_token.is_empty() {
-            new_credentials.refresh_token = Some(new_refresh_token);
-        }
+    if let Some(new_refresh_token) = data.refresh_token.filter(|t| !t.is_empty()) {
+        new_credentials.refresh_token = Some(new_refresh_token);
     }
 
     if let Some(expires_in) = data.expires_in {
@@ -421,7 +435,6 @@ async fn refresh_external_idp_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 不动 profile_arn：IdP 不返回，由 ARN 解析路径（resolve_profile_arn_for）补
     Ok(new_credentials)
 }
 
@@ -496,12 +509,8 @@ pub(crate) async fn get_usage_limits(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
-            // 静默返回空 profile 列表并拒绝数据面调用。
-            request = request.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -597,12 +606,8 @@ pub(crate) async fn get_available_models(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
-            // 静默返回空 profile 列表并拒绝数据面调用。
-            request = request.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -700,12 +705,8 @@ pub(crate) async fn list_available_profiles(
             .header("Connection", "close")
             .body(r#"{"maxResults":10}"#);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
-            // 静默返回空 profile 列表并拒绝数据面调用。
-            request = request.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -797,12 +798,8 @@ pub(crate) async fn set_user_preference(
             .header("Connection", "close")
             .json(&body);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        } else if credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型，否则 CodeWhisperer
-            // 静默返回空 profile 列表并拒绝数据面调用。
-            request = request.header("tokentype", "EXTERNAL_IDP");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -1319,7 +1316,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1391,7 +1392,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1407,8 +1412,7 @@ impl MultiTokenManager {
 
             let (id, credentials) = {
                 // priority 模式固定 current_id；balanced / least_conn 每次重新选择
-                let re_select_each_request =
-                    self.load_balancing_mode.lock().as_str() != "priority";
+                let re_select_each_request = self.load_balancing_mode.lock().as_str() != "priority";
 
                 // 非 priority 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
@@ -1646,7 +1650,13 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
+        // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
+        // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
+        // （issue #23 根因）。entries.lock 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+        // 注：persist_lock 全仓仅此一处获取，且顺序恒为 persist_lock → entries.lock，无死锁。
+        let _write_guard = self.persist_lock.lock();
+
+        // 收集所有凭据（在 persist_lock 保护下拍快照，保证与随后的写盘原子）
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -1664,14 +1674,20 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
-        let _write_guard = self.persist_lock.lock();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+        // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
+        let tmp = path.with_extension("json.tmp");
+        let write_atomic = || -> std::io::Result<()> {
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, path)
+        };
+        let write_result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(write_atomic)
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_atomic()
+        };
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp); // 清理可能残留的临时文件
+            return Err(e).with_context(|| format!("回写凭据文件失败: {:?}", path));
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -2382,7 +2398,10 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !e
+                            .throttled_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
@@ -2699,10 +2718,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2986,12 +3002,8 @@ impl MultiTokenManager {
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
         validated_cred.rpm_limit = new_cred.rpm_limit;
-        validated_cred.auth_method = new_cred.auth_method.map(|m| {
-            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                "idc".to_string()
-            } else {
-                m
-            }
+        validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
+            crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
         if new_cred.profile_arn.is_some() {
             validated_cred.profile_arn = new_cred.profile_arn;
@@ -3000,6 +3012,9 @@ impl MultiTokenManager {
         validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
@@ -3052,10 +3067,7 @@ impl MultiTokenManager {
                     // 同组判定：新凭据无分组 → 与所有凭据同处全局；否则需至少共享一个分组
                     new_groups.is_empty()
                         || e.credentials.groups.is_empty()
-                        || e.credentials
-                            .groups
-                            .iter()
-                            .any(|g| new_groups.contains(g))
+                        || e.credentials.groups.iter().any(|g| new_groups.contains(g))
                 })
                 .map(|e| e.success_count)
                 .min()
@@ -3120,8 +3132,11 @@ impl MultiTokenManager {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups =
-                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry.credentials.groups = g
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
@@ -3494,7 +3509,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
+    fn persist_account_throttle_config(
+        &self,
+        failover: bool,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
@@ -3900,8 +3919,8 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_least_conn_persists() {
-        let config_path = std::env::temp_dir()
-            .join(format!("kiro-lb-least-conn-{}.json", uuid::Uuid::new_v4()));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-lb-least-conn-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
@@ -3918,7 +3937,11 @@ mod tests {
         assert_eq!(manager.get_load_balancing_mode(), "least_conn");
 
         // 非法模式仍应拒绝
-        assert!(manager.set_load_balancing_mode("bogus".to_string()).is_err());
+        assert!(
+            manager
+                .set_load_balancing_mode("bogus".to_string())
+                .is_err()
+        );
 
         std::fs::remove_file(&config_path).unwrap();
     }
@@ -3943,7 +3966,11 @@ mod tests {
             entries.iter_mut().find(|e| e.id == 2).unwrap().in_flight = 0;
         }
         let pick = manager.select_next_credential(None, None);
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "least_conn 应选在途最少的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "least_conn 应选在途最少的 B"
+        );
 
         // 在途相等 → 平局按优先级（默认相同则按更小 id 稳定返回 A）
         {
@@ -4677,7 +4704,8 @@ mod tests {
     async fn test_concurrent_add_same_api_key_inserts_once() {
         let path = tmp_creds_path("concurrent_dedup");
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap(),
         );
 
         const N: usize = 8;
@@ -4698,7 +4726,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+        assert_eq!(
+            ok_count, 1,
+            "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次"
+        );
 
         let snapshot = manager.snapshot();
         assert_eq!(
@@ -4833,6 +4864,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// issue #23 修复：persist_credentials 原子落盘——写盘成功、内容为合法 JSON、
+    /// 且不残留临时文件（tmp+rename）。
+    #[test]
+    fn persist_credentials_writes_atomically_no_tmp_residue() {
+        let path = tmp_creds_path("persist_atomic");
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.refresh_token = Some("tok_aaaa".repeat(5));
+        std::fs::write(&path, serde_json::to_vec_pretty(&[&cred]).unwrap()).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(manager.persist_credentials().unwrap(), "persist 应写盘成功");
+
+        // 文件为合法 JSON 数组
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_array(), "凭据文件应为 JSON 数组");
+        // 原子落盘后不应残留临时文件
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ===== 账号分组隔离回归测试 =====
 
     /// 构造一个带 token、属于指定分组的可用凭据
@@ -4850,7 +4912,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -4892,9 +4957,14 @@ mod tests {
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -4953,7 +5023,11 @@ mod tests {
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "balanced 应在 g1 内选 success_count 最小的 B"
+        );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));

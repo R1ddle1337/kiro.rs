@@ -4,10 +4,10 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -271,11 +271,17 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else { continue };
+                let Some(src) = item.get("source") else {
+                    continue;
+                };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                let n = src
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -624,7 +630,11 @@ pub async fn post_messages(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -633,13 +643,23 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+        )
+        .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -649,6 +669,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::UnsupportedToolMapping(reason) => (
+                    "invalid_request_error",
+                    format!("工具映射不支持: {}", reason),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -779,12 +803,21 @@ async fn handle_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -792,7 +825,13 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -901,10 +940,30 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            // 流结束，发送最终事件（generate_final_events 内部会 finish()
+                            // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "success");
-                            tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
+                            if let Some(message) = ctx.tool_json_error_message() {
+                                // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
+                                // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "error",
+                                    Some(outcome::BAD_REQUEST),
+                                    Some(&message),
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
+                            } else {
+                                record_stream_usage(&hook, &ctx, credential_id, "success");
+                                tracer.finalize(
+                                    "success",
+                                    None,
+                                    None,
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -955,7 +1014,11 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
+            ctx.credits
+        } else {
+            0.0
+        },
     }
 }
 
@@ -978,11 +1041,20 @@ async fn handle_non_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1032,9 +1104,10 @@ async fn handle_non_stream_request(
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
 
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
+    // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
+    let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
+    let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1063,39 +1136,15 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
-
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
-
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
-                                        );
-                                        serde_json::json!({})
-                                    })
-                                };
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
+                            match tool_accumulator.push(&tool_use, &tool_name_map) {
+                                Ok(Some(completed)) => {
+                                    tool_uses.push(completed.to_anthropic_block());
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::error!("{}", e);
+                                    tool_json_error = Some(e);
+                                }
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -1135,10 +1184,41 @@ async fn handle_non_stream_request(
         }
     }
 
+    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
+    // finish() 返回 IncompleteJson。已有错误则保持不变。
+    if tool_json_error.is_none()
+        && let Err(e) = tool_accumulator.finish()
+    {
+        tracing::error!("{}", e);
+        tool_json_error = Some(e);
+    }
+
+    // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
+    // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
+    if let Some(err) = tool_json_error {
+        let message = err.message();
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_tool_json_error", message)),
+        )
+            .into_response();
+    }
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
+
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
+    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
     // 构建响应内容
     let mut content = build_non_stream_content(
@@ -1195,7 +1275,11 @@ async fn handle_non_stream_request(
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1378,7 +1462,11 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1387,13 +1475,23 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+        )
+        .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
+    {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1403,6 +1501,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::UnsupportedToolMapping(reason) => (
+                    "invalid_request_error",
+                    format!("工具映射不支持: {}", reason),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -1535,11 +1637,20 @@ async fn handle_stream_request_buffered(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1668,23 +1779,31 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                             None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
+                                // finish_and_get_all_events 内部会 finish() 累积器；若有半截 /
+                                // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    },
-                                );
+                                let trace_usage = TraceUsage {
+                                    input_tokens: i.max(0) as u64,
+                                    output_tokens: o.max(0) as u64,
+                                    cache_creation_tokens: cc.max(0) as u64,
+                                    cache_read_tokens: cr.max(0) as u64,
+                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                };
+                                if let Some(message) = ctx.tool_json_error_message() {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "error",
+                                        Some(outcome::BAD_REQUEST),
+                                        Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    tracer.finalize("success", None, None, None, trace_usage);
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1803,11 +1922,14 @@ mod tests {
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -1837,7 +1959,8 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -1846,7 +1969,9 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }

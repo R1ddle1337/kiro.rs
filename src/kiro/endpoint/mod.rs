@@ -124,10 +124,8 @@ pub struct RequestContext<'a> {
 ///
 /// 两类语义都是「该凭据当前计费周期内不能再用」，处理方式一致：
 /// 立刻禁用凭据并故障转移到下一个可用凭据。
-const QUOTA_EXHAUSTED_REASONS: &[&str] = &[
-    "MONTHLY_REQUEST_COUNT",
-    "OVERAGE_REQUEST_LIMIT_EXCEEDED",
-];
+const QUOTA_EXHAUSTED_REASONS: &[&str] =
+    &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
 
 /// 默认的"请求额度耗尽"判断逻辑
 ///
@@ -165,8 +163,7 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 /// 与普通 429（high traffic / rate limit exceeded）的关键差异是
 /// 提到 "suspicious activity" 与具体账号 ID。
 pub fn default_is_account_throttled(body: &str) -> bool {
-    body.contains("suspicious activity")
-        && body.contains("temporary limits")
+    body.contains("suspicious activity") && body.contains("temporary limits")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -184,7 +181,7 @@ pub fn default_is_gateway_timeout(body: &str) -> bool {
 /// 而非上游故障）。仅收录**精确 reason 值**，不收录 `ValidationException`
 /// 这类宽泛异常类型——后者语义过宽，裸子串匹配会把恰好携带该词的真实上游
 /// 瞬态故障误判为"不可重试"，反而杀掉本可重试恢复的请求。
-const CLIENT_VALIDATION_REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH"];
+const CLIENT_VALIDATION_REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID"];
 
 /// 触发同类判定的 message 级特征短语（用于无结构化 reason、仅文本报文的场景）
 ///
@@ -260,8 +257,7 @@ mod tests {
     fn test_default_quota_exhausted_substring_does_not_false_match() {
         // 关键字出现在普通字段而非 reason 字段：仍然命中（向后兼容旧行为）
         // 但 reason 字段是其他值时应严格不命中
-        let body =
-            r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
+        let body = r#"{"message":"some text MONTHLY_REQUEST_COUNT-like phrase","reason":"OTHER"}"#;
         assert!(!default_is_monthly_request_limit(body));
     }
 
@@ -282,7 +278,9 @@ mod tests {
             "{\"message\":\"Too many requests\"}"
         ));
         // 仅有一半关键词时也不命中
-        assert!(!default_is_account_throttled("suspicious activity detected"));
+        assert!(!default_is_account_throttled(
+            "suspicious activity detected"
+        ));
     }
 
     #[test]
@@ -310,6 +308,11 @@ mod tests {
         assert!(default_is_client_validation_error(
             "upstream error: TOOL_USE_RESULT_MISMATCH"
         ));
+        // TOOL_SCHEMA_INVALID：工具 inputSchema 不合规（如顶层 oneOf / 非 object），
+        // 根因在请求体，重试/换号不会好，应立即终止。
+        assert!(default_is_client_validation_error(
+            r#"{"__type":"ValidationException","message":"input_schema does not support oneOf, allOf, or anyOf at the top level","reason":"TOOL_SCHEMA_INVALID"}"#
+        ));
         // message 级特异短语（纯文本，无结构化 reason）
         assert!(default_is_client_validation_error(
             "Expected toolResult blocks but found none"
@@ -319,7 +322,9 @@ mod tests {
         assert!(!default_is_client_validation_error(
             r#"{"message":"Internal server error"}"#
         ));
-        assert!(!default_is_client_validation_error("connection reset by peer"));
+        assert!(!default_is_client_validation_error(
+            "connection reset by peer"
+        ));
         // 关键回归：reason 关键词偶然出现在普通字段，但真实 reason 是别的值 —— 不应命中
         // （否则会把一个本可重试恢复的真实上游故障误杀）
         assert!(!default_is_client_validation_error(

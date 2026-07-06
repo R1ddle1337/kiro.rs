@@ -13,24 +13,25 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{
+    normalize_import_auth_method, validate_external_idp_endpoint,
+};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
-    BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
-    GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
-    CredentialsExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
+    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -180,26 +181,10 @@ struct SocialAuthSession {
     callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
-    /// Drop 时自动关闭回调服务器并释放端口（本地模式 Some；远程模式 None）
-    _server_handle: Option<social::ServerHandle>,
-    /// 远程模式：公网 GET 回调路由通过此 Sender 投递回调数据（本地模式 None）。
-    /// 取出后即 None，保证只投递一次。
-    remote_callback_tx:
-        Option<Mutex<Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>>>,
+    /// Drop 时自动关闭回调服务器并释放端口
+    _server_handle: social::ServerHandle,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
-}
-
-/// 远程公网回调投递结果（供 GET 回调路由渲染提示页）
-pub enum RemoteCallbackOutcome {
-    /// 已成功投递，等待轮询完成 token 兑换
-    Delivered,
-    /// 会话不存在（state 不匹配 / 非远程模式会话）
-    NotFound,
-    /// 会话已过期
-    Expired,
-    /// 回调已被处理过（重复点击 / 并发完成）
-    AlreadyCompleted,
 }
 
 /// IdC 设备授权会话状态
@@ -305,7 +290,10 @@ const BUILD_TYPE: &str = "binary";
 /// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
 fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
     let mut s = exe.as_os_str().to_os_string();
-    s.push(format!(".staged-{}", version.trim().trim_start_matches('v')));
+    s.push(format!(
+        ".staged-{}",
+        version.trim().trim_start_matches('v')
+    ));
     std::path::PathBuf::from(s)
 }
 
@@ -358,14 +346,14 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .filter(|s| !s.is_empty())
     }
 
-    // authMethod 规范化："idc" → "IdC"，"external_idp" 原样保留，其余按 social 处理
+    // authMethod 规范化："idc" → "IdC"，"external_idp" 保留，其余按 social 处理。
     let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
         if m.eq_ignore_ascii_case("idc")
             || m.eq_ignore_ascii_case("builder-id")
             || m.eq_ignore_ascii_case("iam")
         {
             "IdC".to_string()
-        } else if m.eq_ignore_ascii_case("external_idp") {
+        } else if cred.is_external_idp_credential() {
             "external_idp".to_string()
         } else {
             "social".to_string()
@@ -944,8 +932,8 @@ impl AdminService {
                         );
 
                         let hit = now.hour() == target_hour && now.minute() == target_minute;
-                        let already_ran_this_minute = last_run_marker.as_deref()
-                            == Some(date_minute_marker.as_str());
+                        let already_ran_this_minute =
+                            last_run_marker.as_deref() == Some(date_minute_marker.as_str());
 
                         if hit && !already_ran_this_minute {
                             last_run_marker = Some(date_minute_marker);
@@ -961,7 +949,7 @@ impl AdminService {
                                     info.latest_version,
                                     info.current_version
                                 );
-                            match svc.apply_image_update().await {
+                                match svc.apply_image_update().await {
                                     Ok(res) => {
                                         tracing::info!("自动更新完成：{}", res.message);
                                         last_applied_version = Some(info.latest_version);
@@ -1025,23 +1013,48 @@ impl AdminService {
             }
         }
 
-        // external_idp（Microsoft Entra ID / Azure AD）刷新依赖 refreshToken + clientId +
-        // tokenEndpoint，缺失则刷新必然失败，提前拒绝并给出明确错误。
-        if req.auth_method.eq_ignore_ascii_case("external_idp") {
+        // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
+        let auth_method =
+            normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
+
+        // 企业 SSO 导入校验：刷新需要 refreshToken、clientId、tokenEndpoint；
+        // tokenEndpoint / issuerUrl 必须过 Microsoft allow-list。
+        if auth_method == "external_idp" {
             let missing: Vec<&str> = [
                 ("refreshToken", req.refresh_token.as_deref()),
                 ("clientId", req.client_id.as_deref()),
                 ("tokenEndpoint", req.token_endpoint.as_deref()),
             ]
             .into_iter()
-            .filter(|(_, v)| v.map(|s| s.trim().is_empty()).unwrap_or(true))
+            .filter(|(_, value)| value.map(|s| s.trim().is_empty()).unwrap_or(true))
             .map(|(name, _)| name)
             .collect();
             if !missing.is_empty() {
                 return Err(AdminServiceError::InvalidCredential(format!(
-                    "external_idp（Entra ID / Azure AD）凭据缺少必填字段: {}",
+                    "企业 SSO (external_idp) 凭据缺少必填字段: {}",
                     missing.join(", ")
                 )));
+            }
+            let token_endpoint = req
+                .token_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(token_endpoint) = token_endpoint else {
+                unreachable!()
+            };
+            validate_external_idp_endpoint(token_endpoint).map_err(|e| {
+                AdminServiceError::InvalidCredential(format!("tokenEndpoint 被拒绝: {}", e))
+            })?;
+            if let Some(issuer) = req
+                .issuer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                validate_external_idp_endpoint(issuer).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!("issuerUrl 被拒绝: {}", e))
+                })?;
             }
         }
 
@@ -1053,7 +1066,7 @@ impl AdminService {
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
             expires_at: req.expires_at,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(auth_method),
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
@@ -1121,8 +1134,7 @@ impl AdminService {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
-                let is_duplicate =
-                    msg.contains("凭据已存在") || msg.contains("重复");
+                let is_duplicate = msg.contains("凭据已存在") || msg.contains("重复");
                 return ImportItemResult {
                     status: if is_duplicate {
                         ImportStatus::Duplicate
@@ -1376,10 +1388,7 @@ impl AdminService {
             message: if reused {
                 format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
             } else {
-                format!(
-                    "已下载并校验 v{} 二进制，可直接执行「更新并重启」",
-                    version
-                )
+                format!("已下载并校验 v{} 二进制，可直接执行「更新并重启」", version)
             },
             output: Some(format!(
                 "{}: v{}\nstaged: {}",
@@ -1644,10 +1653,7 @@ impl AdminService {
     /// `req.github_token` 不为空时使用该 token 验证（用于"保存前先试一下"），
     /// 否则使用配置中已保存的 `config.github_token`，再缺则匿名查询。
     /// `/rate_limit` 端点本身不消耗任何配额。
-    pub async fn check_rate_limit(
-        &self,
-        req: CheckRateLimitRequest,
-    ) -> GitHubRateLimitInfo {
+    pub async fn check_rate_limit(&self, req: CheckRateLimitRequest) -> GitHubRateLimitInfo {
         // 优先用入参 token；空字符串视作"尝试匿名"；缺省回退到已保存 token
         let token = req
             .github_token
@@ -1763,13 +1769,22 @@ impl AdminService {
             .get("resources")
             .and_then(|r| r.get("core"))
             .or_else(|| payload.get("rate"));
-        let limit = core.and_then(|c| c.get("limit")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = core
+            .and_then(|c| c.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let remaining = core
             .and_then(|c| c.get("remaining"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let used = core.and_then(|c| c.get("used")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let reset = core.and_then(|c| c.get("reset")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let used = core
+            .and_then(|c| c.get("used"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reset = core
+            .and_then(|c| c.get("reset"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         // 同时尝试拿 token 对应的用户名；失败不影响主结果
         let login = if authenticated {
@@ -2017,9 +2032,9 @@ impl AdminService {
                 skipped.push(entry.id);
                 continue;
             }
-            let cached = cache_snapshot.get(&entry.id).filter(|c| {
-                (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64
-            });
+            let cached = cache_snapshot
+                .get(&entry.id)
+                .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64);
 
             match cached {
                 // 缓存命中：明确不可开启，跳过
@@ -2042,7 +2057,11 @@ impl AdminService {
         let mut failure_messages: Vec<String> = Vec::new();
 
         for id in targets {
-            match self.token_manager.set_user_preference_for(id, "ENABLED").await {
+            match self
+                .token_manager
+                .set_user_preference_for(id, "ENABLED")
+                .await
+            {
                 Ok(()) => {
                     enabled_ids.push(id);
                     // 失效本地缓存
@@ -2372,7 +2391,16 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    None,
+                    Some(Some(url)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .is_ok()
             {
                 assigned += 1;
@@ -2481,9 +2509,8 @@ impl AdminService {
 
     /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
     ///
-    /// 回调模式由 `config.callbackBaseUrl` 决定：
-    /// - 已配置 → 远程模式：redirect_uri 使用公网地址，由本服务的 `/auth/callback` GET 路由接收回调
-    /// - 未配置 → 本地模式：启动临时 TCP 回调服务器（浏览器与服务端须同机）
+    /// 始终在服务端本机启动临时 TCP 回调服务器，redirect_uri 为 `http://127.0.0.1:{port}`。
+    /// 本机浏览器授权后自动完成；远程访问时用户从地址栏复制回调 URL，经 `complete_social_login` 手动完成。
     pub async fn start_social_login(
         &self,
         req: StartSocialLoginRequest,
@@ -2502,32 +2529,14 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        // 回调模式：配置了 callbackBaseUrl → 远程模式（公网回调路由自动接收）；
-        // 否则本地模式（启动临时 TCP 端口，仅本机浏览器可达）。
-        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
-            Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                // 远程模式：暂存 Sender，由公网 GET 回调路由投递回调数据
-                (
-                    base,
-                    None,
-                    Some(Mutex::new(Some(tx))),
-                    rx,
-                )
-            }
-            None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                (
-                    format!("http://127.0.0.1:{}", port),
-                    Some(server_handle),
-                    None,
-                    rx,
-                )
-            }
-        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        // 启动本地 TCP 回调服务器（本地模式）
+        // 远程访问时用户须从浏览器地址栏复制回调 URL，通过 complete_social_login 接口手动完成
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -2552,7 +2561,6 @@ impl AdminService {
             cred_template,
             proxy,
             _server_handle: server_handle,
-            remote_callback_tx,
             relogin_target_id: None,
         };
 
@@ -2564,7 +2572,6 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
-            remote: remote_base.is_some(),
         })
     }
 
@@ -2748,74 +2755,6 @@ impl AdminService {
             state,
         };
         self.do_complete_social_login(session_id, callback).await
-    }
-
-    /// 解析远程回调 base，优先级：`config.callbackBaseUrl`（显式覆盖 / 逃生口）> 请求自带 base > None（本地模式）。
-    ///
-    /// 返回 None 表示回落本地模式（都未提供 / 提供的值非法时记 warn）。
-    fn resolve_callback_base(&self, req_base: Option<&str>) -> Option<String> {
-        // 优先用 config 显式配置；否则用前端按当前访问地址派生的请求值
-        let raw = self
-            .token_manager
-            .config()
-            .callback_base_url
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| req_base.map(str::to_string))?;
-        let trimmed = raw.trim().trim_end_matches('/');
-        if trimmed.is_empty() {
-            return None;
-        }
-        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-            tracing::warn!(
-                "callbackBaseUrl 非法（须以 http:// 或 https:// 开头），回落本地回调模式: {}",
-                raw
-            );
-            return None;
-        }
-        Some(trimmed.to_string())
-    }
-
-    /// 公网 GET 回调路由调用：按 OAuth state 定位会话并投递回调数据。
-    ///
-    /// 命中且未过期 → 投递进会话 oneshot channel（由 poll_social_login 统一完成 token 兑换）；
-    /// 不存在 / 已过期 / 非远程会话 → 返回相应结果，由调用方渲染提示页。
-    pub fn deliver_remote_social_callback(
-        &self,
-        state: &str,
-        data: social::OAuthCallbackData,
-    ) -> RemoteCallbackOutcome {
-        let sessions = self.social_sessions.lock();
-        // 找到 state 匹配的会话（state 每会话随机，提供 CSRF 保护）
-        let session_id = sessions
-            .iter()
-            .find_map(|(id, s)| (s.state == state).then_some(id.clone()));
-
-        let Some(session_id) = session_id else {
-            return RemoteCallbackOutcome::NotFound;
-        };
-        let session = sessions.get(&session_id).expect("刚查到的会话必然存在");
-        if Utc::now() >= session.expires_at {
-            return RemoteCallbackOutcome::Expired;
-        }
-        let tx_slot = match session.remote_callback_tx.as_ref() {
-            Some(slot) => slot,
-            None => return RemoteCallbackOutcome::NotFound, // 本地模式会话：不应由公网路由投递
-        };
-        // 释放外层锁后再投递（send 不阻塞，但避免持锁发送）
-        let tx = tx_slot.lock().take();
-        drop(sessions);
-        match tx {
-            Some(tx) => {
-                if tx.send(data).is_ok() {
-                    RemoteCallbackOutcome::Delivered
-                } else {
-                    // 接收端已消失（会话被并发完成/移除）→ 视为已处理
-                    RemoteCallbackOutcome::AlreadyCompleted
-                }
-            }
-            None => RemoteCallbackOutcome::AlreadyCompleted,
-        }
     }
 
     /// 分类删除凭据错误
@@ -3051,25 +2990,12 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        // 回调模式同 start_social_login：远程模式走公网回调路由，本地模式走临时端口
-        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
-            Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                (base, None, Some(Mutex::new(Some(tx))), rx)
-            }
-            None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                (
-                    format!("http://127.0.0.1:{}", port),
-                    Some(server_handle),
-                    None,
-                    rx,
-                )
-            }
-        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -3085,7 +3011,6 @@ impl AdminService {
             cred_template: KiroCredentials::default(),
             proxy,
             _server_handle: server_handle,
-            remote_callback_tx,
             relogin_target_id: Some(target_id),
         };
 
@@ -3097,7 +3022,6 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
-            remote: remote_base.is_some(),
         })
     }
 
@@ -3195,9 +3119,8 @@ mod tests {
         cred.email = Some("e@example.com".to_string());
         cred.expires_at = Some("2026-06-06T00:00:00Z".to_string());
         // 占位符 profileArn 应在导出时被剥离
-        cred.profile_arn = Some(
-            crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
-        );
+        cred.profile_arn =
+            Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
 
         let acc = credential_to_export_account(cred).expect("应生成账号");
 
@@ -3230,7 +3153,10 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO FREE")), "Free");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
-        assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
+        assert_eq!(
+            subscription_type_from_title(Some("KIRO POWER")),
+            "Enterprise"
+        );
         assert_eq!(subscription_type_from_title(None), "Free");
     }
 }
