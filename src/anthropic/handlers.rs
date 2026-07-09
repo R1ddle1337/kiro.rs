@@ -4,10 +4,10 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -271,17 +271,11 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else {
-                    continue;
-                };
+                let Some(src) = item.get("source") else { continue };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -370,32 +364,7 @@ fn resolve_usage_input_tokens(
 }
 
 fn available_models() -> Vec<Model> {
-    let model = |id: &str, display_name: &str, owned_by: &str, max_tokens: i32| Model {
-        id: id.to_string(),
-        object: "model".to_string(),
-        created: 1781481600,
-        owned_by: owned_by.to_string(),
-        display_name: display_name.to_string(),
-        model_type: "chat".to_string(),
-        max_tokens,
-    };
-
-    let mut models = vec![
-        model("auto", "Auto", "kiro", 64000),
-        model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", 64000),
-        model("claude-opus-4.8", "Claude Opus 4.8", "anthropic", 64000),
-        model("claude-opus-4.7", "Claude Opus 4.7", "anthropic", 64000),
-        model("claude-opus-4.6", "Claude Opus 4.6", "anthropic", 64000),
-        model("claude-sonnet-4.6", "Claude Sonnet 4.6", "anthropic", 64000),
-        model("claude-opus-4.5", "Claude Opus 4.5", "anthropic", 64000),
-        model("claude-sonnet-4.5", "Claude Sonnet 4.5", "anthropic", 64000),
-        model("claude-sonnet-4", "Claude Sonnet 4", "anthropic", 64000),
-        model("claude-haiku-4.5", "Claude Haiku 4.5", "anthropic", 64000),
-        model("deepseek-3.2", "DeepSeek v3.2", "deepseek", 64000),
-        model("minimax-m2.5", "MiniMax M2.5", "minimax", 64000),
-        model("minimax-m2.1", "MiniMax M2.1", "minimax", 64000),
-        model("glm-5", "GLM 5", "zhipu", 64000),
-        model("qwen3-coder-next", "Qwen3 Coder Next", "qwen", 64000),
+    vec![
         Model {
             id: "claude-fable-5".to_string(),
             object: "model".to_string(),
@@ -576,11 +545,7 @@ fn available_models() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
-
-    let mut seen = std::collections::HashSet::new();
-    models.retain(|model| seen.insert(model.id.clone()));
-    models
+    ]
 }
 
 /// GET /v1/models
@@ -659,11 +624,7 @@ pub async fn post_messages(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -672,23 +633,13 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
-        return super::websearch_loop::run_web_search_loop(
-            provider,
-            payload,
-            hook,
-            payload_stream,
-            key_ctx.group.clone(),
-            state.tool_compatibility_mode,
-        )
-        .await;
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+            .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -698,10 +649,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -832,21 +782,12 @@ async fn handle_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -854,13 +795,7 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
-        model,
-        input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -1043,11 +978,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
-            ctx.credits
-        } else {
-            0.0
-        },
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
     }
 }
 
@@ -1070,20 +1001,11 @@ async fn handle_non_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1304,11 +1226,7 @@ async fn handle_non_stream_request(
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
+            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1491,11 +1409,7 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1504,23 +1418,13 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
-        return super::websearch_loop::run_web_search_loop(
-            provider,
-            payload,
-            hook,
-            payload_stream,
-            key_ctx.group.clone(),
-            state.tool_compatibility_mode,
-        )
-        .await;
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+            .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1530,10 +1434,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -1666,20 +1569,11 @@ async fn handle_stream_request_buffered(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1950,44 +1844,12 @@ mod tests {
     }
 
     #[test]
-    fn available_models_include_native_kiro_models() {
-        let models = available_models();
-        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
-
-        assert!(ids.contains(&"auto"));
-        assert!(ids.contains(&"deepseek-3.2"));
-        assert!(ids.contains(&"minimax-m2.5"));
-        assert!(ids.contains(&"minimax-m2.1"));
-        assert!(ids.contains(&"glm-5"));
-        assert!(ids.contains(&"qwen3-coder-next"));
-        assert!(ids.contains(&"claude-sonnet-4.6"));
-        assert!(ids.contains(&"claude-opus-4.8"));
-    }
-
-    #[test]
-    fn available_models_have_unique_ids() {
-        let models = available_models();
-        let mut seen = std::collections::HashSet::new();
-
-        for model in models {
-            assert!(
-                seen.insert(model.id.clone()),
-                "duplicate model id: {}",
-                model.id
-            );
-        }
-    }
-
-    #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -2017,8 +1879,7 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -2027,9 +1888,7 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }
